@@ -37,8 +37,14 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def send_telegram(msg):
+    """إرسال رسالة إلى تيليجرام وإعادة كائن الاستجابة"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    try:
+        resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+        return resp
+    except Exception as e:
+        print(f"استثناء في إرسال تيليجرام: {e}")
+        return None
 
 
 def fetch_data(pair):
@@ -63,11 +69,6 @@ def compute_indicators(df):
 
 
 def detect_signal(df, pair):
-    """
-    إشارة تقاطع متوسطات (Golden Cross / Death Cross) مع فلتر RSI:
-    - شراء: المتوسط السريع (20) يقطع البطيء (50) لأعلى، و RSI أقل من 70.
-    - بيع: المتوسط السريع يقطع البطيء لأسفل، و RSI أعلى من 30.
-    """
     if len(df) < MA_SLOW + 2:
         return None
 
@@ -86,7 +87,6 @@ def detect_signal(df, pair):
 
     direction = "BUY" if golden_cross else "SELL"
 
-    # فلتر RSI
     if direction == "BUY" and rsi > RSI_OVERBOUGHT:
         return None
     if direction == "SELL" and rsi < RSI_OVERSOLD:
@@ -134,8 +134,16 @@ def store_signal(signal):
 
 def main():
     print(f"تشغيل البوت في {datetime.utcnow()}")
-    found_any_signal = False
 
+    # ✅ رسالة اختبار اتصال تيليجرام
+    test_msg = "✅ البوت يعمل الآن ويتابع الأسواق كل 5 دقائق..."
+    resp = send_telegram(test_msg)
+    if resp:
+        print(f"حالة إرسال تيليجرام: {resp.status_code} - {resp.text[:200]}")
+    else:
+        print("فشل إرسال رسالة اختبار تيليجرام")
+
+    found_any_signal = False
     for pair in PAIRS:
         try:
             df = fetch_data(pair)
