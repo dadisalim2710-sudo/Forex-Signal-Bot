@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 import pandas as pd
 import numpy as np
@@ -6,6 +7,7 @@ import ta
 import yfinance as yf
 from datetime import datetime, timedelta
 from supabase import create_client
+import schedule
 
 # ========== الإعدادات ==========
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -32,11 +34,13 @@ ATR_PERIOD = 14
 ATR_SL_MULT = 1.5
 ATR_TP_MULT = 2.0
 
-# فلتر الاتجاه
 TREND_MA_FAST = 10
 TREND_MA_SLOW = 20
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# لتتبع آخر تحديث تم معالجته في تيليجرام
+LAST_UPDATE_ID = None
 
 
 def send_telegram(msg):
@@ -50,8 +54,11 @@ def send_telegram(msg):
 
 
 def get_telegram_updates():
-    """جلب آخر تحديثات تيليجرام ومعالجة الأوامر"""
+    """جلب آخر رسائل تيليجرام ومعالجة /stats فقط"""
+    global LAST_UPDATE_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    if LAST_UPDATE_ID is not None:
+        url += f"?offset={LAST_UPDATE_ID + 1}"
     try:
         resp = requests.get(url)
         if resp.status_code != 200:
@@ -68,9 +75,8 @@ def get_telegram_updates():
             if msg_text.strip().lower() == "/stats":
                 handle_stats(chat_id)
 
-            # تنظيف: نحذف التحديثات التي عولجت لتجنب التكرار
-            update_id = update["update_id"]
-            requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={update_id+1}")
+            # تحديث آخر معرّف
+            LAST_UPDATE_ID = update["update_id"]
 
     except Exception as e:
         print(f"خطأ في getUpdates: {e}")
@@ -80,7 +86,6 @@ def handle_stats(chat_id):
     """توليد رد /stats من Supabase"""
     try:
         since = (datetime.utcnow() - timedelta(hours=24)).isoformat()
-        # الإصلاح هنا: desc=True بدلاً من ascending=False
         res = supabase.table("signals") \
             .select("pair, direction, entry, created_at") \
             .gte("created_at", since) \
@@ -122,8 +127,6 @@ def compute_indicators(df):
     df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], ATR_PERIOD)
     df['highest'] = df['high'].shift(1).rolling(LOOKBACK).max()
     df['lowest'] = df['low'].shift(1).rolling(LOOKBACK).min()
-
-    # متوسطات الاتجاه
     df['ma_trend_fast'] = ta.trend.sma_indicator(df['close'], TREND_MA_FAST)
     df['ma_trend_slow'] = ta.trend.sma_indicator(df['close'], TREND_MA_SLOW)
     return df
@@ -146,7 +149,6 @@ def detect_signal(df, pair):
     close = last['close']
     direction = None
 
-    # إشارة الاختراق
     if close > highest and rsi < RSI_OVERBOUGHT:
         direction = "BUY"
     elif close < lowest and rsi > RSI_OVERSOLD:
@@ -155,7 +157,6 @@ def detect_signal(df, pair):
     if direction is None:
         return None
 
-    # فلتر تأكيد الاتجاه
     ma_fast = last['ma_trend_fast']
     ma_slow = last['ma_trend_slow']
     if pd.isna(ma_fast) or pd.isna(ma_slow):
@@ -206,35 +207,25 @@ def store_signal(signal):
         print("فشل تخزين الإشارة:", e)
 
 
-def main():
-    print(f"تشغيل البوت في {datetime.utcnow()}")
-
-    # التحقق من أوامر تيليجرام (مثل /stats)
-    get_telegram_updates()
-
-    # رسالة اختبار صامتة
-    send_telegram("✅ البوت يعمل ويتابع الأسواق...")
-
+def job_analyze_markets():
+    """المهمة التي تحلل الأسواق كل دقيقتين"""
+    print(f"تحليل الأسواق - {datetime.utcnow()}")
     found_any_signal = False
     for pair in PAIRS:
         try:
             df = fetch_data(pair)
             if df is None:
                 continue
-
             df = compute_indicators(df)
             sig = detect_signal(df, pair)
-
             if sig:
                 found_any_signal = True
-
                 if sig['direction'] == "BUY":
                     operation = "🟢 شراء"
                     trend = "صاعد"
                 else:
                     operation = "🔴 بيع"
                     trend = "نازل"
-
                 msg = (
                     f"{operation} | {pair}\n"
                     f"الاتجاه: {trend}\n"
@@ -242,7 +233,6 @@ def main():
                     f"وقف الخسارة: {sig['stop_loss']}\n"
                     f"الهدف: {sig['take_profit']}"
                 )
-
                 print(msg)
                 send_telegram(msg)
                 store_signal(sig)
@@ -250,9 +240,32 @@ def main():
                 print(f"[{pair}] لا توجد إشارة حالياً")
         except Exception as e:
             print(f"خطأ في زوج {pair}: {e}")
-
     if not found_any_signal:
-        print("انتهى البوت بدون العثور على أي إشارة.")
+        print("انتهى التحليل بدون إشارات.")
+
+
+def main():
+    print("✅ بدء تشغيل البوت الدائم على Railway...")
+    send_telegram("✅ البوت يعمل الآن 24/7 على Railway 🚀")
+
+    # جدولة التحليل كل دقيقتين
+    schedule.every(2).minutes.do(job_analyze_markets)
+
+    # حلقة لا نهائية: معالجة رسائل تيليجرام وتنفيذ المهام المجدولة
+    while True:
+        try:
+            # فحص رسائل تيليجرام (كل 3 ثوانٍ)
+            get_telegram_updates()
+        except Exception as e:
+            print(f"خطأ في حلقة تيليجرام: {e}")
+
+        try:
+            # تنفيذ المهام المجدولة (التحليل)
+            schedule.run_pending()
+        except Exception as e:
+            print(f"خطأ في المجدول: {e}")
+
+        time.sleep(3)  # انتظر 3 ثوانٍ ثم كرر
 
 
 if __name__ == "__main__":
