@@ -24,11 +24,10 @@ PAIRS = [
 
 TIMEFRAME = "5m"
 PERIOD = "5d"
-MA_FAST = 10        # أسرع من السابق (كان 20)
-MA_SLOW = 30        # أسرع من السابق (كان 50)
+LOOKBACK = 5               # عدد الشموع لاختراق القمة/القاع
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 75
-RSI_OVERSOLD = 25
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
 ATR_PERIOD = 14
 ATR_SL_MULT = 1.5
 ATR_TP_MULT = 2.0
@@ -42,7 +41,7 @@ def send_telegram(msg):
         resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
         return resp
     except Exception as e:
-        print(f"استثناء في إرسال تيليجرام: {e}")
+        print(f"استثناء تيليجرام: {e}")
         return None
 
 
@@ -60,53 +59,46 @@ def fetch_data(pair):
 
 
 def compute_indicators(df):
-    df['ma_fast'] = ta.trend.sma_indicator(df['close'], MA_FAST)
-    df['ma_slow'] = ta.trend.sma_indicator(df['close'], MA_SLOW)
     df['rsi'] = ta.momentum.rsi(df['close'], RSI_PERIOD)
     df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], ATR_PERIOD)
-    # MACD
-    macd = ta.trend.MACD(df['close'])
-    df['macd'] = macd.macd()
-    df['macd_signal'] = macd.macd_signal()
+    # أعلى قمة وأدنى قاع لآخر LOOKBACK شموع (بدون الشمعة الحالية)
+    df['highest'] = df['high'].shift(1).rolling(LOOKBACK).max()
+    df['lowest'] = df['low'].shift(1).rolling(LOOKBACK).min()
     return df
 
 
 def detect_signal(df, pair):
-    if len(df) < MA_SLOW + 5:
+    if len(df) < LOOKBACK + 5:
         return None
 
-    prev = df.iloc[-2]
     last = df.iloc[-1]
-
-    golden_cross = (prev['ma_fast'] <= prev['ma_slow']) and (last['ma_fast'] > last['ma_slow'])
-    death_cross  = (prev['ma_fast'] >= prev['ma_slow']) and (last['ma_fast'] < last['ma_slow'])
-
-    if not golden_cross and not death_cross:
-        return None
-
     rsi = last['rsi']
     if pd.isna(rsi):
         return None
 
-    direction = "BUY" if golden_cross else "SELL"
-
-    # فلتر RSI
-    if direction == "BUY" and rsi > RSI_OVERBOUGHT:
-        return None
-    if direction == "SELL" and rsi < RSI_OVERSOLD:
+    highest = last['highest']
+    lowest = last['lowest']
+    if pd.isna(highest) or pd.isna(lowest):
         return None
 
-    # فلتر MACD
-    if direction == "BUY" and last['macd'] <= last['macd_signal']:
-        return None
-    if direction == "SELL" and last['macd'] >= last['macd_signal']:
+    close = last['close']
+    direction = None
+
+    # شراء: اختراق القمة لأعلى
+    if close > highest and rsi < RSI_OVERBOUGHT:
+        direction = "BUY"
+    # بيع: كسر القاع لأسفل
+    elif close < lowest and rsi > RSI_OVERSOLD:
+        direction = "SELL"
+
+    if direction is None:
         return None
 
     atr = last['atr']
     if pd.isna(atr) or atr <= 0:
-        atr = last['close'] * 0.0005
+        atr = close * 0.0005
 
-    entry = last['close']
+    entry = close
     if direction == "BUY":
         sl = entry - ATR_SL_MULT * atr
         tp = entry + ATR_TP_MULT * atr
@@ -146,12 +138,11 @@ def main():
     print(f"تشغيل البوت في {datetime.utcnow()}")
 
     # رسالة اختبار
-    test_msg = "✅ البوت يعمل الآن (استراتيجية سريعة) ويتابع الأسواق..."
-    resp = send_telegram(test_msg)
+    resp = send_telegram("✅ البوت يعمل (استراتيجية الاختراق السريع) ويتابع الأسواق...")
     if resp:
-        print(f"حالة إرسال تيليجرام: {resp.status_code} - {resp.text[:200]}")
+        print(f"حالة تيليجرام: {resp.status_code} - {resp.text[:200]}")
     else:
-        print("فشل إرسال رسالة اختبار تيليجرام")
+        print("فشل إرسال رسالة تيليجرام")
 
     found_any_signal = False
     for pair in PAIRS:
@@ -183,7 +174,7 @@ def main():
 
     if not found_any_signal:
         print("انتهى البوت بدون العثور على أي إشارة.")
-        send_telegram("ℹ️ لم تظهر أي توصية هذه الدورة.")
+        send_telegram("ℹ️ لا توجد اختراقات هذه الدورة.")
 
 
 if __name__ == "__main__":
