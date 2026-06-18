@@ -7,15 +7,15 @@ import yfinance as yf
 from datetime import datetime
 from supabase import create_client
 
-# ========== الإعدادات (تُسحب تلقائياً من أسرار GitHub) ==========
+# ========== الإعدادات ==========
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
-# قائمة الأزواج – الذهب الآن في المقدمة كما طلبت
+# الذهب = GC=F (عقود الذهب الآجلة – السعر قريب جداً من XAUUSD الفوري)
 PAIRS = [
-    "XAUUSD=X",    # الذهب مقابل الدولار
+    "GC=F",        # الذهب
     "EURUSD=X",
     "GBPUSD=X",
     "USDJPY=X",
@@ -37,7 +37,6 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def send_telegram(msg):
-    """إرسال رسالة إلى تيليجرام"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
 
@@ -57,7 +56,6 @@ def fetch_data(pair):
 
 
 def compute_indicators(df):
-    """حساب المتوسطات و RSI و ATR"""
     df['ma_fast'] = ta.trend.sma_indicator(df['close'], MA_FAST)
     df['ma_slow'] = ta.trend.sma_indicator(df['close'], MA_SLOW)
     df['rsi'] = ta.momentum.rsi(df['close'], RSI_PERIOD)
@@ -68,11 +66,6 @@ def compute_indicators(df):
 
 
 def detect_signal_test(df, pair):
-    """
-    إشارة سريعة للاختبار:
-    - شراء: آخر 3 شموع كلها صاعدة (close > open) والسعر فوق المتوسط السريع.
-    - بيع: آخر 3 شموع كلها هابطة (close < open) والسعر تحت المتوسط السريع.
-    """
     if len(df) < 10:
         return None
 
@@ -94,10 +87,9 @@ def detect_signal_test(df, pair):
     else:
         return None
 
-    # حساب ATR لتحديد SL/TP
     atr = last['atr']
     if pd.isna(atr) or atr <= 0:
-        atr = last['close'] * 0.0005  # قيمة افتراضية صغيرة للذهب والفوركس
+        atr = last['close'] * 0.0005
 
     entry = last['close']
     if direction == "BUY":
@@ -124,7 +116,6 @@ def detect_signal_test(df, pair):
 
 
 def store_signal(signal):
-    """تخزين الإشارة في Supabase"""
     try:
         supabase.table("signals").insert({
             "pair": signal["pair"],
