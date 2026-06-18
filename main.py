@@ -24,11 +24,11 @@ PAIRS = [
 
 TIMEFRAME = "5m"
 PERIOD = "5d"
-MA_FAST = 20
-MA_SLOW = 50
+MA_FAST = 10        # أسرع من السابق (كان 20)
+MA_SLOW = 30        # أسرع من السابق (كان 50)
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 75
+RSI_OVERSOLD = 25
 ATR_PERIOD = 14
 ATR_SL_MULT = 1.5
 ATR_TP_MULT = 2.0
@@ -37,7 +37,6 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def send_telegram(msg):
-    """إرسال رسالة إلى تيليجرام وإعادة كائن الاستجابة"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
@@ -65,11 +64,15 @@ def compute_indicators(df):
     df['ma_slow'] = ta.trend.sma_indicator(df['close'], MA_SLOW)
     df['rsi'] = ta.momentum.rsi(df['close'], RSI_PERIOD)
     df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], ATR_PERIOD)
+    # MACD
+    macd = ta.trend.MACD(df['close'])
+    df['macd'] = macd.macd()
+    df['macd_signal'] = macd.macd_signal()
     return df
 
 
 def detect_signal(df, pair):
-    if len(df) < MA_SLOW + 2:
+    if len(df) < MA_SLOW + 5:
         return None
 
     prev = df.iloc[-2]
@@ -87,9 +90,16 @@ def detect_signal(df, pair):
 
     direction = "BUY" if golden_cross else "SELL"
 
+    # فلتر RSI
     if direction == "BUY" and rsi > RSI_OVERBOUGHT:
         return None
     if direction == "SELL" and rsi < RSI_OVERSOLD:
+        return None
+
+    # فلتر MACD
+    if direction == "BUY" and last['macd'] <= last['macd_signal']:
+        return None
+    if direction == "SELL" and last['macd'] >= last['macd_signal']:
         return None
 
     atr = last['atr']
@@ -135,8 +145,8 @@ def store_signal(signal):
 def main():
     print(f"تشغيل البوت في {datetime.utcnow()}")
 
-    # ✅ رسالة اختبار اتصال تيليجرام
-    test_msg = "✅ البوت يعمل الآن ويتابع الأسواق كل 5 دقائق..."
+    # رسالة اختبار
+    test_msg = "✅ البوت يعمل الآن (استراتيجية سريعة) ويتابع الأسواق..."
     resp = send_telegram(test_msg)
     if resp:
         print(f"حالة إرسال تيليجرام: {resp.status_code} - {resp.text[:200]}")
@@ -173,6 +183,7 @@ def main():
 
     if not found_any_signal:
         print("انتهى البوت بدون العثور على أي إشارة.")
+        send_telegram("ℹ️ لم تظهر أي توصية هذه الدورة.")
 
 
 if __name__ == "__main__":
