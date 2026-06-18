@@ -24,7 +24,7 @@ PAIRS = [
 
 TIMEFRAME = "5m"
 PERIOD = "5d"
-LOOKBACK = 5               # عدد الشموع لاختراق القمة/القاع
+LOOKBACK = 2               # عدد الشموع لاختراق القمة/القاع
 RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
