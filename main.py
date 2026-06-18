@@ -13,7 +13,6 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
-# الذهب = GC=F (عقود الذهب الآجلة – السعر قريب جداً من XAUUSD الفوري)
 PAIRS = [
     "GC=F",        # الذهب
     "EURUSD=X",
@@ -29,6 +28,7 @@ MA_FAST = 20
 MA_SLOW = 50
 RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
 ATR_PERIOD = 14
 ATR_SL_MULT = 1.5
 ATR_TP_MULT = 2.0
@@ -42,7 +42,6 @@ def send_telegram(msg):
 
 
 def fetch_data(pair):
-    """جلب بيانات من Yahoo Finance"""
     try:
         df = yf.download(pair, interval=TIMEFRAME, period=PERIOD, progress=False)
         if not df.empty and len(df) >= 50:
@@ -59,32 +58,38 @@ def compute_indicators(df):
     df['ma_fast'] = ta.trend.sma_indicator(df['close'], MA_FAST)
     df['ma_slow'] = ta.trend.sma_indicator(df['close'], MA_SLOW)
     df['rsi'] = ta.momentum.rsi(df['close'], RSI_PERIOD)
-    df['atr'] = ta.volatility.average_true_range(
-        df['high'], df['low'], df['close'], ATR_PERIOD
-    )
+    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], ATR_PERIOD)
     return df
 
 
-def detect_signal_test(df, pair):
-    if len(df) < 10:
+def detect_signal(df, pair):
+    """
+    إشارة تقاطع متوسطات (Golden Cross / Death Cross) مع فلتر RSI:
+    - شراء: المتوسط السريع (20) يقطع البطيء (50) لأعلى، و RSI أقل من 70.
+    - بيع: المتوسط السريع يقطع البطيء لأسفل، و RSI أعلى من 30.
+    """
+    if len(df) < MA_SLOW + 2:
         return None
 
-    last3 = df.iloc[-3:]
-    all_bullish = all(last3['close'] > last3['open'])
-    all_bearish = all(last3['close'] < last3['open'])
-
-    if not all_bullish and not all_bearish:
-        return None
-
+    prev = df.iloc[-2]
     last = df.iloc[-1]
-    if pd.isna(last['ma_fast']):
+
+    golden_cross = (prev['ma_fast'] <= prev['ma_slow']) and (last['ma_fast'] > last['ma_slow'])
+    death_cross  = (prev['ma_fast'] >= prev['ma_slow']) and (last['ma_fast'] < last['ma_slow'])
+
+    if not golden_cross and not death_cross:
         return None
 
-    if all_bullish and last['close'] > last['ma_fast']:
-        direction = "BUY"
-    elif all_bearish and last['close'] < last['ma_fast']:
-        direction = "SELL"
-    else:
+    rsi = last['rsi']
+    if pd.isna(rsi):
+        return None
+
+    direction = "BUY" if golden_cross else "SELL"
+
+    # فلتر RSI
+    if direction == "BUY" and rsi > RSI_OVERBOUGHT:
+        return None
+    if direction == "SELL" and rsi < RSI_OVERSOLD:
         return None
 
     atr = last['atr']
@@ -99,10 +104,6 @@ def detect_signal_test(df, pair):
         sl = entry + ATR_SL_MULT * atr
         tp = entry - ATR_TP_MULT * atr
 
-    rsi_value = last['rsi']
-    if pd.isna(rsi_value):
-        rsi_value = 50.0
-
     return {
         "pair": pair,
         "direction": direction,
@@ -110,7 +111,7 @@ def detect_signal_test(df, pair):
         "stop_loss": round(sl, 5),
         "take_profit": round(tp, 5),
         "atr": round(atr, 5),
-        "rsi": round(rsi_value, 2),
+        "rsi": round(rsi, 2),
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -142,7 +143,7 @@ def main():
                 continue
 
             df = compute_indicators(df)
-            sig = detect_signal_test(df, pair)
+            sig = detect_signal(df, pair)
 
             if sig:
                 found_any_signal = True
