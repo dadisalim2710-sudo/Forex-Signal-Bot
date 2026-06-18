@@ -32,7 +32,7 @@ ATR_PERIOD = 14
 ATR_SL_MULT = 1.5
 ATR_TP_MULT = 2.0
 
-# فلتر الاتجاه الجديد
+# فلتر الاتجاه
 TREND_MA_FAST = 10
 TREND_MA_SLOW = 20
 
@@ -79,12 +79,12 @@ def get_telegram_updates():
 def handle_stats(chat_id):
     """توليد رد /stats من Supabase"""
     try:
-        # إحضار توصيات آخر 24 ساعة
         since = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        # الإصلاح هنا: desc=True بدلاً من ascending=False
         res = supabase.table("signals") \
             .select("pair, direction, entry, created_at") \
             .gte("created_at", since) \
-            .order("created_at", ascending=False) \
+            .order("created_at", desc=True) \
             .execute()
 
         signals = res.data or []
