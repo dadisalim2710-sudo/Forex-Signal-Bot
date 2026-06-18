@@ -61,7 +61,6 @@ def fetch_data(pair):
 def compute_indicators(df):
     df['rsi'] = ta.momentum.rsi(df['close'], RSI_PERIOD)
     df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], ATR_PERIOD)
-    # أعلى قمة وأدنى قاع لآخر LOOKBACK شموع (بدون الشمعة الحالية)
     df['highest'] = df['high'].shift(1).rolling(LOOKBACK).max()
     df['lowest'] = df['low'].shift(1).rolling(LOOKBACK).min()
     return df
@@ -84,10 +83,8 @@ def detect_signal(df, pair):
     close = last['close']
     direction = None
 
-    # شراء: اختراق القمة لأعلى
     if close > highest and rsi < RSI_OVERBOUGHT:
         direction = "BUY"
-    # بيع: كسر القاع لأسفل
     elif close < lowest and rsi > RSI_OVERSOLD:
         direction = "SELL"
 
@@ -137,12 +134,8 @@ def store_signal(signal):
 def main():
     print(f"تشغيل البوت في {datetime.utcnow()}")
 
-    # رسالة اختبار
-    resp = send_telegram("✅ البوت يعمل (استراتيجية الاختراق السريع) ويتابع الأسواق...")
-    if resp:
-        print(f"حالة تيليجرام: {resp.status_code} - {resp.text[:200]}")
-    else:
-        print("فشل إرسال رسالة تيليجرام")
+    # رسالة اختبار صامتة
+    send_telegram("✅ البوت يعمل ويتابع الأسواق...")
 
     found_any_signal = False
     for pair in PAIRS:
@@ -156,14 +149,24 @@ def main():
 
             if sig:
                 found_any_signal = True
+
+                # تحديد نوع التوصية والاتجاه
+                if sig['direction'] == "BUY":
+                    operation = "🟢 شراء"
+                    trend = "صاعد"
+                else:
+                    operation = "🔴 بيع"
+                    trend = "نازل"
+
+                # بناء الرسالة: الزوج كما هو (بدون ترجمة)
                 msg = (
-                    f"🚨 توصية {sig['direction']} على {pair}\n"
-                    f"الدخول: {sig['entry']}\n"
+                    f"{operation} | {pair}\n"
+                    f"الاتجاه: {trend}\n"
+                    f"نقطة الدخول: {sig['entry']}\n"
                     f"وقف الخسارة: {sig['stop_loss']}\n"
-                    f"الهدف: {sig['take_profit']}\n"
-                    f"ATR: {sig['atr']} | RSI: {sig['rsi']}\n"
-                    f"الوقت: {sig['timestamp']}"
+                    f"الهدف: {sig['take_profit']}"
                 )
+
                 print(msg)
                 send_telegram(msg)
                 store_signal(sig)
@@ -174,7 +177,6 @@ def main():
 
     if not found_any_signal:
         print("انتهى البوت بدون العثور على أي إشارة.")
-        send_telegram("ℹ️ لا توجد اختراقات هذه الدورة.")
 
 
 if __name__ == "__main__":
