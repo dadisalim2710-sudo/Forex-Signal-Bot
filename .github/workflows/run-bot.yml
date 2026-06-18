@@ -2,7 +2,7 @@ name: Forex Signal Bot
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # كل 5 دقائق
+    - cron: '*/2 * * * *'   # كل دقيقتين
   workflow_dispatch:         # إمكانية التشغيل اليدوي
 
 jobs:
