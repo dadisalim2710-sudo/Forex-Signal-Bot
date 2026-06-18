@@ -4,3 +4,4 @@ numpy
 ta
 requests
 supabase
+schedule
