@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import ta
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 from supabase import create_client
 
 # ========== الإعدادات ==========
@@ -24,13 +24,17 @@ PAIRS = [
 
 TIMEFRAME = "5m"
 PERIOD = "5d"
-LOOKBACK = 2               # عدد الشموع لاختراق القمة/القاع
+LOOKBACK = 2
 RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
 ATR_PERIOD = 14
 ATR_SL_MULT = 1.5
 ATR_TP_MULT = 2.0
+
+# فلتر الاتجاه الجديد
+TREND_MA_FAST = 10
+TREND_MA_SLOW = 20
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -43,6 +47,61 @@ def send_telegram(msg):
     except Exception as e:
         print(f"استثناء تيليجرام: {e}")
         return None
+
+
+def get_telegram_updates():
+    """جلب آخر تحديثات تيليجرام ومعالجة الأوامر"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    try:
+        resp = requests.get(url)
+        if resp.status_code != 200:
+            return
+        data = resp.json()
+        if not data.get("ok"):
+            return
+
+        for update in data.get("result", []):
+            if "message" not in update:
+                continue
+            msg_text = update["message"].get("text", "")
+            chat_id = update["message"]["chat"]["id"]
+            if msg_text.strip().lower() == "/stats":
+                handle_stats(chat_id)
+
+            # تنظيف: نحذف التحديثات التي عولجت لتجنب التكرار
+            update_id = update["update_id"]
+            requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={update_id+1}")
+
+    except Exception as e:
+        print(f"خطأ في getUpdates: {e}")
+
+
+def handle_stats(chat_id):
+    """توليد رد /stats من Supabase"""
+    try:
+        # إحضار توصيات آخر 24 ساعة
+        since = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        res = supabase.table("signals") \
+            .select("pair, direction, entry, created_at") \
+            .gte("created_at", since) \
+            .order("created_at", ascending=False) \
+            .execute()
+
+        signals = res.data or []
+        total = len(signals)
+        if total == 0:
+            reply = "ℹ️ لا توجد توصيات خلال آخر 24 ساعة."
+        else:
+            last = signals[0]
+            reply = (
+                f"📊 إحصائيات آخر 24 ساعة:\n"
+                f"• إجمالي التوصيات: {total}\n"
+                f"• أحدث توصية: {last['direction']} {last['pair']}\n"
+                f"• لم يتم تتبع الصفقات المغلقة بعد (ميزة قادمة)."
+            )
+        send_telegram(reply)
+    except Exception as e:
+        send_telegram(f"خطأ في الإحصائيات: {e}")
 
 
 def fetch_data(pair):
@@ -63,11 +122,15 @@ def compute_indicators(df):
     df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], ATR_PERIOD)
     df['highest'] = df['high'].shift(1).rolling(LOOKBACK).max()
     df['lowest'] = df['low'].shift(1).rolling(LOOKBACK).min()
+
+    # متوسطات الاتجاه
+    df['ma_trend_fast'] = ta.trend.sma_indicator(df['close'], TREND_MA_FAST)
+    df['ma_trend_slow'] = ta.trend.sma_indicator(df['close'], TREND_MA_SLOW)
     return df
 
 
 def detect_signal(df, pair):
-    if len(df) < LOOKBACK + 5:
+    if len(df) < max(LOOKBACK, TREND_MA_FAST, TREND_MA_SLOW) + 2:
         return None
 
     last = df.iloc[-1]
@@ -83,12 +146,24 @@ def detect_signal(df, pair):
     close = last['close']
     direction = None
 
+    # إشارة الاختراق
     if close > highest and rsi < RSI_OVERBOUGHT:
         direction = "BUY"
     elif close < lowest and rsi > RSI_OVERSOLD:
         direction = "SELL"
 
     if direction is None:
+        return None
+
+    # فلتر تأكيد الاتجاه
+    ma_fast = last['ma_trend_fast']
+    ma_slow = last['ma_trend_slow']
+    if pd.isna(ma_fast) or pd.isna(ma_slow):
+        return None
+
+    if direction == "BUY" and ma_fast <= ma_slow:
+        return None
+    if direction == "SELL" and ma_fast >= ma_slow:
         return None
 
     atr = last['atr']
@@ -134,6 +209,9 @@ def store_signal(signal):
 def main():
     print(f"تشغيل البوت في {datetime.utcnow()}")
 
+    # التحقق من أوامر تيليجرام (مثل /stats)
+    get_telegram_updates()
+
     # رسالة اختبار صامتة
     send_telegram("✅ البوت يعمل ويتابع الأسواق...")
 
@@ -150,7 +228,6 @@ def main():
             if sig:
                 found_any_signal = True
 
-                # تحديد نوع التوصية والاتجاه
                 if sig['direction'] == "BUY":
                     operation = "🟢 شراء"
                     trend = "صاعد"
@@ -158,7 +235,6 @@ def main():
                     operation = "🔴 بيع"
                     trend = "نازل"
 
-                # بناء الرسالة: الزوج كما هو (بدون ترجمة)
                 msg = (
                     f"{operation} | {pair}\n"
                     f"الاتجاه: {trend}\n"
