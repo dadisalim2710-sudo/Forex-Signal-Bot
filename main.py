@@ -1,7 +1,7 @@
 import os, time, requests, pandas as pd, numpy as np, ta, yfinance as yf
 from datetime import datetime, timedelta
 from supabase import create_client
-import schedule, joblib
+import schedule, joblib, threading
 
 # ========== الإعدادات ==========
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -26,10 +26,14 @@ ATR_TP_MULT = 2.0
 TREND_MA_FAST = 10
 TREND_MA_SLOW = 20
 MIN_CONFIDENCE = 65
-MAX_DATA_AGE_MINUTES = 60  # الحد الأقصى لعمر آخر شمعة (دقائق)
+MAX_DATA_AGE_MINUTES = 60
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-LAST_UPDATE_ID = None
+
+# قفل لمنع معالجة أكثر من طلب في نفس الوقت
+update_lock = threading.Lock()
+# آخر معرف تمت معالجته (نبدأ من لا شيء)
+PROCESSED_UPDATE_IDS = set()
 
 model = None
 try:
@@ -51,25 +55,47 @@ def send_telegram(msg):
 
 
 def get_telegram_updates():
-    global LAST_UPDATE_ID
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    if LAST_UPDATE_ID is not None:
-        url += f"?offset={LAST_UPDATE_ID + 1}"
-    try:
-        resp = requests.get(url)
-        if resp.status_code != 200: return
-        data = resp.json()
-        if not data.get("ok"): return
-        for update in data.get("result", []):
-            if "message" not in update: continue
-            msg_text = update["message"].get("text", "").strip().lower()
-            chat_id = update["message"]["chat"]["id"]
-            if msg_text == "/stats": handle_stats(chat_id)
-            elif msg_text == "/performance": handle_performance(chat_id)
-            elif msg_text in ["/win", "/loss", "/be"]: close_last_signal(chat_id, msg_text[1:])
-            LAST_UPDATE_ID = update["update_id"]
-    except Exception as e:
-        print(f"خطأ في getUpdates: {e}")
+    """
+    جلب التحديثات مرة واحدة، معالجة كل أمر لمرة واحدة فقط،
+    واستخدام القفل لمنع التداخل.
+    """
+    with update_lock:
+        try:
+            # نطلب التحديثات دون offset لنرى كل شيء، لكننا نعالج فقط ما لم نعالجه
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+            resp = requests.get(url, timeout=5)
+            if resp.status_code != 200:
+                return
+            data = resp.json()
+            if not data.get("ok"):
+                return
+
+            for update in data.get("result", []):
+                update_id = update["update_id"]
+
+                # نتخطى أي تحديث تمت معالجته مسبقاً
+                if update_id in PROCESSED_UPDATE_IDS:
+                    continue
+
+                if "message" not in update:
+                    continue
+
+                msg_text = update["message"].get("text", "").strip().lower()
+                chat_id = update["message"]["chat"]["id"]
+
+                # معالجة الأمر
+                if msg_text == "/stats":
+                    handle_stats(chat_id)
+                elif msg_text == "/performance":
+                    handle_performance(chat_id)
+                elif msg_text in ["/win", "/loss", "/be"]:
+                    close_last_signal(chat_id, msg_text[1:])
+
+                # تسجيل أننا عالجنا هذا التحديث
+                PROCESSED_UPDATE_IDS.add(update_id)
+
+        except Exception as e:
+            print(f"خطأ في getUpdates: {e}")
 
 
 def handle_stats(chat_id):
@@ -86,7 +112,7 @@ def handle_stats(chat_id):
             reply = (f"📊 إحصائيات آخر 24 ساعة:\n"
                      f"• إجمالي التوصيات: {total}\n"
                      f"• أحدث توصية: {last['direction']} {last['pair']}\n"
-                     f"• نظام AI + تحليل ذكي (سوق مفلتر)")
+                     f"• نظام AI + تحليل ذكي")
         send_telegram(reply)
     except Exception as e:
         send_telegram(f"خطأ في الإحصائيات: {e}")
@@ -143,17 +169,9 @@ def close_last_signal(chat_id, result):
 
 # ========== فلتر السوق ==========
 def is_market_open(pair):
-    """
-    تعيد True إذا كان السوق مفتوحاً (آخر شمعة حديثة ويوم العمل أسبوعي).
-    الفوركس يغلق الجمعة مساءً بتوقيت UTC، والذهب لديه جلسات شبه مستمرة.
-    """
     now = datetime.utcnow()
-    # عطلة نهاية الأسبوع: السبت والأحد (UTC) السوق الفوركس مغلق
-    if now.weekday() in [5, 6]:  # 5=Saturday, 6=Sunday
-        # الذهب (GC=F) قد يكون مفتوحاً إلكترونياً يوم الأحد مساءً، لكن من باب السلامة نغلقه أيضاً
+    if now.weekday() in [5, 6]:
         return False
-
-    # تحقق من عمر آخر شمعة
     try:
         df = yf.download(pair, period="1d", interval="5m", progress=False)
         if df.empty:
@@ -330,7 +348,7 @@ def generate_local_analysis(signal):
         reasons.append("اختراق صاعد مع زخم إيجابي")
     else:
         reasons.append("اختراق هابط مع زخم سلبي")
-    if signal['adx'] > 25:
+    if signal.get('adx', 0) > 25:
         reasons.append("اتجاه قوي (ADX مرتفع)")
     if signal['rsi'] < 40 and signal['direction'] == "BUY":
         reasons.append("RSI في منطقة مناسبة للشراء")
@@ -426,8 +444,8 @@ def monitor_open_trades():
 
 
 def main():
-    print("✅ بدء البوت الخارق (فلتر سوق ذكي)...")
-    send_telegram("🚀 البوت الخارق يعمل مع فلتر السوق ولن يرسل توصيات أثناء الإغلاق")
+    print("✅ بدء البوت الخارق (مضاد للتكرار)...")
+    send_telegram("🚀 البوت الخارق يعمل بدون تكرار للردود")
 
     schedule.every(2).minutes.do(job_analyze_markets)
     schedule.every(1).minutes.do(monitor_open_trades)
