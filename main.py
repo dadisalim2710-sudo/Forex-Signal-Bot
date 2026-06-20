@@ -1,7 +1,7 @@
 import os, time, requests, pandas as pd, numpy as np, ta, yfinance as yf
 from datetime import datetime, timedelta
 from supabase import create_client
-import schedule, joblib, threading
+import schedule, joblib
 
 # ========== الإعدادات ==========
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -30,10 +30,10 @@ MAX_DATA_AGE_MINUTES = 60
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# قفل لمنع معالجة أكثر من طلب في نفس الوقت
-update_lock = threading.Lock()
-# آخر معرف تمت معالجته (نبدأ من لا شيء)
-PROCESSED_UPDATE_IDS = set()
+# متغيرات التحكم في التكرار
+LAST_UPDATE_ID = None
+PROCESSED_COMMANDS = {}  # مفتاح: (chat_id, command), قيمة: وقت آخر معالجة
+COMMAND_COOLDOWN = 5     # ثوانٍ بين تنفيذ نفس الأمر من نفس المستخدم
 
 model = None
 try:
@@ -48,7 +48,7 @@ except Exception as e:
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        return requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+        return requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
         print(f"تيليجرام خطأ: {e}")
         return None
@@ -56,46 +56,67 @@ def send_telegram(msg):
 
 def get_telegram_updates():
     """
-    جلب التحديثات مرة واحدة، معالجة كل أمر لمرة واحدة فقط،
-    واستخدام القفل لمنع التداخل.
+    Long-polling حقيقي: نطلب التحديثات مع offset، نعالج أول تحديث جديد فقط،
+    ونزيح offset بعده، ثم نخرج لنعيد النداء بعد 3 ثوان.
+    هذا يمنع تكرار المعالجة.
     """
-    with update_lock:
-        try:
-            # نطلب التحديثات دون offset لنرى كل شيء، لكننا نعالج فقط ما لم نعالجه
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-            resp = requests.get(url, timeout=5)
-            if resp.status_code != 200:
-                return
-            data = resp.json()
-            if not data.get("ok"):
-                return
+    global LAST_UPDATE_ID
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?timeout=5"
+        if LAST_UPDATE_ID is not None:
+            url += f"&offset={LAST_UPDATE_ID + 1}"
 
-            for update in data.get("result", []):
-                update_id = update["update_id"]
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            return
 
-                # نتخطى أي تحديث تمت معالجته مسبقاً
-                if update_id in PROCESSED_UPDATE_IDS:
-                    continue
+        data = resp.json()
+        if not data.get("ok"):
+            return
 
-                if "message" not in update:
-                    continue
+        results = data.get("result", [])
+        if not results:
+            return
 
-                msg_text = update["message"].get("text", "").strip().lower()
-                chat_id = update["message"]["chat"]["id"]
+        # نعالج أول تحديث جديد فقط (ضمان عدم التكرار)
+        for update in results:
+            update_id = update["update_id"]
+            # نتأكد أننا لم نتجاوز هذا التحديث مسبقاً
+            if LAST_UPDATE_ID is not None and update_id <= LAST_UPDATE_ID:
+                continue
 
-                # معالجة الأمر
-                if msg_text == "/stats":
-                    handle_stats(chat_id)
-                elif msg_text == "/performance":
-                    handle_performance(chat_id)
-                elif msg_text in ["/win", "/loss", "/be"]:
-                    close_last_signal(chat_id, msg_text[1:])
+            if "message" not in update:
+                continue
 
-                # تسجيل أننا عالجنا هذا التحديث
-                PROCESSED_UPDATE_IDS.add(update_id)
+            msg_text = update["message"].get("text", "").strip().lower()
+            chat_id = update["message"]["chat"]["id"]
 
-        except Exception as e:
-            print(f"خطأ في getUpdates: {e}")
+            # فحص التكرار عبر قاموس (chat_id, command) مع وقت تنفيذ آخر
+            cache_key = (chat_id, msg_text)
+            now_ts = time.time()
+            last_exec = PROCESSED_COMMANDS.get(cache_key, 0)
+            if now_ts - last_exec < COMMAND_COOLDOWN:
+                # تخطي: نفس الأمر نُفّذ قبل أقل من 5 ثوان
+                LAST_UPDATE_ID = update_id
+                continue
+
+            # تنفيذ الأمر
+            if msg_text == "/stats":
+                handle_stats(chat_id)
+            elif msg_text == "/performance":
+                handle_performance(chat_id)
+            elif msg_text in ["/win", "/loss", "/be"]:
+                close_last_signal(chat_id, msg_text[1:])
+
+            # تسجيل وقت التنفيذ وتحديث آخر معرف
+            PROCESSED_COMMANDS[cache_key] = now_ts
+            LAST_UPDATE_ID = update_id
+
+            # نخرج بعد معالجة تحديث واحد لتجنب أي تكرار
+            break
+
+    except Exception as e:
+        print(f"خطأ في getUpdates: {e}")
 
 
 def handle_stats(chat_id):
@@ -185,7 +206,7 @@ def is_market_open(pair):
         return False
 
 
-# ========== دوال السوق ==========
+# ========== دوال السوق (بدون تغيير) ==========
 def fetch_data(pair):
     try:
         df = yf.download(pair, interval=TIMEFRAME, period=PERIOD, progress=False)
@@ -290,7 +311,6 @@ def detect_signal_advanced(df, pair):
 def analyze_with_gemini(signal):
     if not GEMINI_API_KEY:
         return True, generate_local_analysis(signal)
-
     prompt = f"""You are an expert forex/gold analyst. Analyze this signal briefly:
 Pair: {signal['pair']}
 Direction: {signal['direction']} (call it "buy" or "sell")
@@ -304,56 +324,41 @@ Reply with ONLY this exact format:
 DECISION: [APPROVE or REJECT]
 REASON: [one short sentence in English]
 FINAL_CONFIDENCE: [0-100]"""
-
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
         resp = requests.post(url, json={
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.3, "maxOutputTokens": 100}
-        })
+        }, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            print(f"[Gemini] {text}")
-
             decision = "REJECT"
             reason = ""
             final_conf = signal['confidence']
             for line in text.split('\n'):
                 line = line.strip()
-                if line.upper().startswith("DECISION:"):
-                    decision = line.split(":", 1)[1].strip().upper()
-                elif line.upper().startswith("REASON:"):
-                    reason = line.split(":", 1)[1].strip()
-                elif line.upper().startswith("FINAL_CONFIDENCE:"):
-                    val = line.split(":", 1)[1].strip().replace('%', '')
-                    final_conf = int(float(val))
-
+                if line.upper().startswith("DECISION:"): decision = line.split(":",1)[1].strip().upper()
+                elif line.upper().startswith("REASON:"): reason = line.split(":",1)[1].strip()
+                elif line.upper().startswith("FINAL_CONFIDENCE:"): final_conf = int(float(line.split(":",1)[1].strip().replace('%','')))
             if decision == "APPROVE":
                 signal['confidence'] = final_conf
                 return True, reason
             else:
                 return False, reason
         else:
-            print(f"خطأ Gemini: {resp.status_code}")
             return True, generate_local_analysis(signal)
-    except Exception as e:
-        print(f"استثناء Gemini: {e}")
+    except:
         return True, generate_local_analysis(signal)
 
 
 def generate_local_analysis(signal):
     reasons = []
-    if signal['direction'] == "BUY":
-        reasons.append("اختراق صاعد مع زخم إيجابي")
-    else:
-        reasons.append("اختراق هابط مع زخم سلبي")
-    if signal.get('adx', 0) > 25:
-        reasons.append("اتجاه قوي (ADX مرتفع)")
-    if signal['rsi'] < 40 and signal['direction'] == "BUY":
-        reasons.append("RSI في منطقة مناسبة للشراء")
-    elif signal['rsi'] > 60 and signal['direction'] == "SELL":
-        reasons.append("RSI في منطقة مناسبة للبيع")
+    if signal['direction'] == "BUY": reasons.append("اختراق صاعد مع زخم إيجابي")
+    else: reasons.append("اختراق هابط مع زخم سلبي")
+    if signal.get('adx',0) > 25: reasons.append("اتجاه قوي (ADX مرتفع)")
+    if signal['rsi'] < 40 and signal['direction']=="BUY": reasons.append("RSI في منطقة مناسبة للشراء")
+    elif signal['rsi'] > 60 and signal['direction']=="SELL": reasons.append("RSI في منطقة مناسبة للبيع")
     return " | ".join(reasons)
 
 
@@ -376,7 +381,7 @@ def job_analyze_markets():
     found = False
     for pair in PAIRS:
         if not is_market_open(pair):
-            print(f"[{pair}] السوق مغلق أو البيانات قديمة، تخطي...")
+            print(f"[{pair}] السوق مغلق...")
             continue
         try:
             df = fetch_data(pair)
@@ -384,12 +389,11 @@ def job_analyze_markets():
             df = compute_features(df)
             sig, conf = detect_signal_advanced(df, pair)
             if not sig: continue
-
             approved, reason = analyze_with_gemini(sig)
             if approved:
                 found = True
-                op = "🟢 شراء" if sig['direction'] == "BUY" else "🔴 بيع"
-                trend = "صاعد" if sig['direction'] == "BUY" else "نازل"
+                op = "🟢 شراء" if sig['direction']=="BUY" else "🔴 بيع"
+                trend = "صاعد" if sig['direction']=="BUY" else "نازل"
                 msg = (f"{op} | {sig['pair']}\n"
                        f"الاتجاه: {trend}\n"
                        f"نقطة الدخول: {sig['entry']}\n"
@@ -397,21 +401,17 @@ def job_analyze_markets():
                        f"الهدف: {sig['take_profit']}\n"
                        f"الثقة: {sig['confidence']}%\n"
                        f"🧠 تحليل: {reason}")
-                print(msg)
                 send_telegram(msg)
                 store_signal(sig)
-            else:
-                print(f"[{sig['pair']}] رفض: {reason}")
         except Exception as e:
             print(f"خطأ في زوج {pair}: {e}")
     if not found:
-        print("انتهى التحليل بدون توصيات (أو السوق مغلق).")
+        print("لا توجد توصيات.")
 
 
 def monitor_open_trades():
-    print(f"مراقبة الصفقات - {datetime.utcnow()}")
     try:
-        res = supabase.table("signals").select("*").eq("status", "open").execute()
+        res = supabase.table("signals").select("*").eq("status","open").execute()
         trades = res.data or []
         for trade in trades:
             pair = trade['pair']
@@ -430,36 +430,28 @@ def monitor_open_trades():
                 if current_price <= tp: result = "win"
                 elif current_price >= sl: result = "loss"
                 else: continue
-            pips = abs(entry - tp) * 10000 if result == "win" else -abs(entry - sl) * 10000
+            pips = abs(entry-tp)*10000 if result=="win" else -abs(entry-sl)*10000
             supabase.table("signals").update({
-                "status": result, "result_pips": round(pips, 1),
+                "status": result, "result_pips": round(pips,1),
                 "closed_at": datetime.utcnow().isoformat()
             }).eq("id", trade["id"]).execute()
-            emoji = "🎯" if result == "win" else "🛑"
-            txt = "تم تحقيق الهدف" if result == "win" else "تم ضرب الوقف"
-            msg = f"{emoji} {txt} | {pair} {direction}\nالنتيجة: {pips:+.1f} نقطة"
-            send_telegram(msg)
+            emoji = "🎯" if result=="win" else "🛑"
+            txt = "تم تحقيق الهدف" if result=="win" else "تم ضرب الوقف"
+            send_telegram(f"{emoji} {txt} | {pair} {direction}\nالنتيجة: {pips:+.1f} نقطة")
     except Exception as e:
-        print(f"خطأ في مراقبة الصفقات: {e}")
+        print(f"خطأ مراقبة: {e}")
 
 
 def main():
-    print("✅ بدء البوت الخارق (مضاد للتكرار)...")
-    send_telegram("🚀 البوت الخارق يعمل بدون تكرار للردود")
-
+    print("✅ بدء البوت الخارق (بدون تكرار)...")
+    send_telegram("🚀 البوت الخارق يعمل الآن والردود لن تتكرر")
     schedule.every(2).minutes.do(job_analyze_markets)
     schedule.every(1).minutes.do(monitor_open_trades)
 
     while True:
-        try:
-            get_telegram_updates()
-        except Exception as e:
-            print(f"خطأ حلقة تيليجرام: {e}")
-        try:
-            schedule.run_pending()
-        except Exception as e:
-            print(f"خطأ المجدول: {e}")
-        time.sleep(3)
+        get_telegram_updates()
+        schedule.run_pending()
+        time.sleep(1)
 
 
 if __name__ == "__main__":
