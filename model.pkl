@@ -1,0 +1,44 @@
+# train_model.py
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import ta
+from sklearn.ensemble import RandomForestClassifier
+import joblib
+
+# نجلب بيانات تدريب لزوج EURUSD على إطار 5 دقائق (أكبر فترة ممكنة)
+df = yf.download("EURUSD=X", interval="5m", period="60d")
+df.columns = ['open','high','low','close','volume']
+
+# نحسب المؤشرات
+df['rsi'] = ta.momentum.rsi(df['close'], 14)
+df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], 14)
+macd = ta.trend.MACD(df['close'])
+df['macd_diff'] = macd.macd() - macd.macd_signal()
+adx = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], 14)
+df['adx'] = adx.adx()
+bb = ta.volatility.BollingerBands(df['close'], 20, 2)
+df['bb_width'] = (bb.bollinger_hband() - bb.bollinger_lband()) / df['close']
+df['ma_fast'] = ta.trend.sma_indicator(df['close'], 10)
+df['ma_slow'] = ta.trend.sma_indicator(df['close'], 20)
+df['volume'] = df['volume'].fillna(0)
+
+# الهدف: هل تحرك السعر لأعلى بنسبة 0.1% خلال 3 شموع قادمة؟
+df['future_close'] = df['close'].shift(-3)
+df['target'] = ((df['future_close'] - df['close']) / df['close']) > 0.001
+df['target'] = df['target'].astype(int)
+
+# إسقاط الصفوف الفارغة
+df.dropna(inplace=True)
+
+features = ['rsi', 'atr', 'macd_diff', 'adx', 'bb_width', 'volume', 'close',
+            'ma_fast', 'ma_slow']
+X = df[features]
+y = df['target']
+
+model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
+model.fit(X, y)
+
+# حفظ النموذج
+joblib.dump(model, "model.pkl")
+print("✅ تم تدريب النموذج وحفظه في model.pkl")
