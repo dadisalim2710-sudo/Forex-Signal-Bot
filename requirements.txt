@@ -5,3 +5,5 @@ ta
 requests
 supabase
 schedule
+scikit-learn
+joblib
