@@ -26,6 +26,7 @@ ATR_TP_MULT = 2.0
 TREND_MA_FAST = 10
 TREND_MA_SLOW = 20
 MIN_CONFIDENCE = 65
+MAX_DATA_AGE_MINUTES = 60  # الحد الأقصى لعمر آخر شمعة (دقائق)
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 LAST_UPDATE_ID = None
@@ -85,7 +86,7 @@ def handle_stats(chat_id):
             reply = (f"📊 إحصائيات آخر 24 ساعة:\n"
                      f"• إجمالي التوصيات: {total}\n"
                      f"• أحدث توصية: {last['direction']} {last['pair']}\n"
-                     f"• نظام AI + تحليل ذكي")
+                     f"• نظام AI + تحليل ذكي (سوق مفلتر)")
         send_telegram(reply)
     except Exception as e:
         send_telegram(f"خطأ في الإحصائيات: {e}")
@@ -138,6 +139,32 @@ def close_last_signal(chat_id, result):
         send_telegram(f"✅ تم إغلاق {sig['pair']} {sig['direction']} ({result}) - {pips:+.1f} نقطة")
     except Exception as e:
         send_telegram(f"فشل إغلاق الصفقة: {e}")
+
+
+# ========== فلتر السوق ==========
+def is_market_open(pair):
+    """
+    تعيد True إذا كان السوق مفتوحاً (آخر شمعة حديثة ويوم العمل أسبوعي).
+    الفوركس يغلق الجمعة مساءً بتوقيت UTC، والذهب لديه جلسات شبه مستمرة.
+    """
+    now = datetime.utcnow()
+    # عطلة نهاية الأسبوع: السبت والأحد (UTC) السوق الفوركس مغلق
+    if now.weekday() in [5, 6]:  # 5=Saturday, 6=Sunday
+        # الذهب (GC=F) قد يكون مفتوحاً إلكترونياً يوم الأحد مساءً، لكن من باب السلامة نغلقه أيضاً
+        return False
+
+    # تحقق من عمر آخر شمعة
+    try:
+        df = yf.download(pair, period="1d", interval="5m", progress=False)
+        if df.empty:
+            return False
+        last_time = df.index[-1]
+        if isinstance(last_time, pd.Timestamp):
+            last_time = last_time.to_pydatetime()
+        age_minutes = (now - last_time).total_seconds() / 60
+        return age_minutes < MAX_DATA_AGE_MINUTES
+    except Exception:
+        return False
 
 
 # ========== دوال السوق ==========
@@ -243,9 +270,8 @@ def detect_signal_advanced(df, pair):
 
 
 def analyze_with_gemini(signal):
-    """تحليل الإشارة باستخدام Gemini (مجاني)"""
     if not GEMINI_API_KEY:
-        return True, generate_local_analysis(signal)  # بدون مفتاح، استخدم التحليل المحلي
+        return True, generate_local_analysis(signal)
 
     prompt = f"""You are an expert forex/gold analyst. Analyze this signal briefly:
 Pair: {signal['pair']}
@@ -299,7 +325,6 @@ FINAL_CONFIDENCE: [0-100]"""
 
 
 def generate_local_analysis(signal):
-    """توليد تحليل نصي محلي إذا لم يتوفر Gemini"""
     reasons = []
     if signal['direction'] == "BUY":
         reasons.append("اختراق صاعد مع زخم إيجابي")
@@ -332,6 +357,9 @@ def job_analyze_markets():
     print(f"تحليل الأسواق - {datetime.utcnow()}")
     found = False
     for pair in PAIRS:
+        if not is_market_open(pair):
+            print(f"[{pair}] السوق مغلق أو البيانات قديمة، تخطي...")
+            continue
         try:
             df = fetch_data(pair)
             if df is None: continue
@@ -339,9 +367,7 @@ def job_analyze_markets():
             sig, conf = detect_signal_advanced(df, pair)
             if not sig: continue
 
-            # تحليل Gemini (أو محلي)
             approved, reason = analyze_with_gemini(sig)
-
             if approved:
                 found = True
                 op = "🟢 شراء" if sig['direction'] == "BUY" else "🔴 بيع"
@@ -361,7 +387,7 @@ def job_analyze_markets():
         except Exception as e:
             print(f"خطأ في زوج {pair}: {e}")
     if not found:
-        print("انتهى التحليل بدون توصيات.")
+        print("انتهى التحليل بدون توصيات (أو السوق مغلق).")
 
 
 def monitor_open_trades():
@@ -400,8 +426,8 @@ def monitor_open_trades():
 
 
 def main():
-    print("✅ بدء البوت الخارق (Gemini مجاني)...")
-    send_telegram("🚀 البوت الخارق يعمل بتقنية الذكاء الاصطناعي المجاني (Gemini + تحليل محلي)")
+    print("✅ بدء البوت الخارق (فلتر سوق ذكي)...")
+    send_telegram("🚀 البوت الخارق يعمل مع فلتر السوق ولن يرسل توصيات أثناء الإغلاق")
 
     schedule.every(2).minutes.do(job_analyze_markets)
     schedule.every(1).minutes.do(monitor_open_trades)
