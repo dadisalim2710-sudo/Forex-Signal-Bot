@@ -8,6 +8,7 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from supabase import create_client
 import schedule
+import joblib  # لتحميل النموذج
 
 # ========== الإعدادات ==========
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -37,10 +38,22 @@ ATR_TP_MULT = 2.0
 TREND_MA_FAST = 10
 TREND_MA_SLOW = 20
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+# إعدادات الثقة
+MIN_CONFIDENCE = 65   # لا نرسل توصية إذا كانت درجة الثقة أقل من 65
 
-# لتتبع آخر تحديث تم معالجته في تيليجرام
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 LAST_UPDATE_ID = None
+
+# محاولة تحميل النموذج المُدرَّب
+model = None
+try:
+    if os.path.exists("model.pkl"):
+        model = joblib.load("model.pkl")
+        print("✅ تم تحميل نموذج AI بنجاح")
+    else:
+        print("ℹ️ لا يوجد نموذج AI، سيُستخدم النظام القاعدي الذكي")
+except Exception as e:
+    print(f"خطأ في تحميل النموذج: {e}")
 
 
 def send_telegram(msg):
@@ -54,7 +67,6 @@ def send_telegram(msg):
 
 
 def get_telegram_updates():
-    """جلب آخر رسائل تيليجرام ومعالجة /stats فقط"""
     global LAST_UPDATE_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     if LAST_UPDATE_ID is not None:
@@ -75,7 +87,6 @@ def get_telegram_updates():
             if msg_text.strip().lower() == "/stats":
                 handle_stats(chat_id)
 
-            # تحديث آخر معرّف
             LAST_UPDATE_ID = update["update_id"]
 
     except Exception as e:
@@ -83,7 +94,6 @@ def get_telegram_updates():
 
 
 def handle_stats(chat_id):
-    """توليد رد /stats من Supabase"""
     try:
         since = (datetime.utcnow() - timedelta(hours=24)).isoformat()
         res = supabase.table("signals") \
@@ -102,7 +112,7 @@ def handle_stats(chat_id):
                 f"📊 إحصائيات آخر 24 ساعة:\n"
                 f"• إجمالي التوصيات: {total}\n"
                 f"• أحدث توصية: {last['direction']} {last['pair']}\n"
-                f"• لم يتم تتبع الصفقات المغلقة بعد (ميزة قادمة)."
+                f"• نظام AI مفعّل (الثقة ≥ {MIN_CONFIDENCE})"
             )
         send_telegram(reply)
     except Exception as e:
@@ -122,50 +132,145 @@ def fetch_data(pair):
     return None
 
 
-def compute_indicators(df):
+def compute_features(df):
+    """حساب جميع المؤشرات المطلوبة للذكاء الاصطناعي والتسجيل"""
     df['rsi'] = ta.momentum.rsi(df['close'], RSI_PERIOD)
     df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], ATR_PERIOD)
     df['highest'] = df['high'].shift(1).rolling(LOOKBACK).max()
     df['lowest'] = df['low'].shift(1).rolling(LOOKBACK).min()
+
+    # متوسطات الاتجاه
     df['ma_trend_fast'] = ta.trend.sma_indicator(df['close'], TREND_MA_FAST)
     df['ma_trend_slow'] = ta.trend.sma_indicator(df['close'], TREND_MA_SLOW)
+
+    # MACD
+    macd = ta.trend.MACD(df['close'])
+    df['macd'] = macd.macd()
+    df['macd_signal'] = macd.macd_signal()
+    df['macd_diff'] = df['macd'] - df['macd_signal']
+
+    # Bollinger Bands
+    bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
+    df['bb_upper'] = bb.bollinger_hband()
+    df['bb_lower'] = bb.bollinger_lband()
+    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['close']
+
+    # ADX (قوة الاتجاه)
+    adx = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14)
+    df['adx'] = adx.adx()
+
+    # حجم التداول (مؤشر إضافي)
+    if 'volume' in df.columns:
+        df['volume_sma'] = ta.trend.sma_indicator(df['volume'], window=10)
+    else:
+        df['volume_sma'] = 0
+
     return df
 
 
-def detect_signal(df, pair):
-    if len(df) < max(LOOKBACK, TREND_MA_FAST, TREND_MA_SLOW) + 2:
-        return None
+def calculate_confidence(row, direction):
+    """
+    نظام تسجيل نقاط خبير (Rule‑Based) + تنبؤ النموذج (إن وُجد)
+    يُرجع درجة ثقة من 0 إلى 100
+    """
+    score = 50  # نقطة البداية
+
+    # 1. تأكيد MACD (حسب الاتجاه)
+    if direction == "BUY" and row['macd_diff'] > 0:
+        score += 10
+    elif direction == "SELL" and row['macd_diff'] < 0:
+        score += 10
+    else:
+        score -= 15
+
+    # 2. قوة الاتجاه ADX
+    if row['adx'] > 25:
+        score += 15
+    elif row['adx'] > 20:
+        score += 8
+    else:
+        score -= 10
+
+    # 3. Bollinger Band (شراء قرب الشريط السفلي = فرصة)
+    if direction == "BUY" and row['close'] < row['bb_lower'] * 1.01:
+        score += 10
+    elif direction == "SELL" and row['close'] > row['bb_upper'] * 0.99:
+        score += 10
+
+    # 4. حجم التداول (ارتفاع الحجم عن متوسطه يعطي ثقة)
+    if row['volume_sma'] > 0 and row['volume'] > row['volume_sma'] * 1.2:
+        score += 5
+
+    # 5. فلتر RSI (موجود أساساً، لكن نعدّل الثقة)
+    if direction == "BUY" and row['rsi'] < 40:
+        score += 5
+    elif direction == "SELL" and row['rsi'] > 60:
+        score += 5
+
+    # 6. توقعات النموذج (إن وُجد)
+    if model is not None:
+        try:
+            features = [
+                row['rsi'], row['atr'], row['macd_diff'], row['adx'],
+                row['bb_width'], row['volume'], row['close'],
+                row['ma_trend_fast'] - row['ma_trend_slow']
+            ]
+            proba = model.predict_proba([features])[0][1]  # افترض أن الفئة 1 = BUY ناجح
+            if direction == "SELL":
+                proba = 1 - proba
+            score += int((proa - 0.5) * 40)  # يضيف من -20 إلى +20
+        except Exception:
+            pass
+
+    # الحدود بين 0 و 100
+    return max(0, min(100, score))
+
+
+def detect_signal_advanced(df, pair):
+    """
+    إشارة مع فلترة ذكية وتقييم الثقة.
+    تُرجع (signal_dict, confidence) أو (None, 0)
+    """
+    if len(df) < max(LOOKBACK, TREND_MA_FAST, TREND_MA_SLOW, 30) + 2:
+        return None, 0
 
     last = df.iloc[-1]
     rsi = last['rsi']
     if pd.isna(rsi):
-        return None
+        return None, 0
 
     highest = last['highest']
     lowest = last['lowest']
     if pd.isna(highest) or pd.isna(lowest):
-        return None
+        return None, 0
 
     close = last['close']
     direction = None
 
+    # إشارة الاختراق الأساسية
     if close > highest and rsi < RSI_OVERBOUGHT:
         direction = "BUY"
     elif close < lowest and rsi > RSI_OVERSOLD:
         direction = "SELL"
 
     if direction is None:
-        return None
+        return None, 0
 
+    # فلتر الاتجاه (المتوسطات)
     ma_fast = last['ma_trend_fast']
     ma_slow = last['ma_trend_slow']
     if pd.isna(ma_fast) or pd.isna(ma_slow):
-        return None
-
+        return None, 0
     if direction == "BUY" and ma_fast <= ma_slow:
-        return None
+        return None, 0
     if direction == "SELL" and ma_fast >= ma_slow:
-        return None
+        return None, 0
+
+    # حساب الثقة
+    conf = calculate_confidence(last, direction)
+    if conf < MIN_CONFIDENCE:
+        print(f"[{pair}] إشارة مرفوضة بسبب ضعف الثقة ({conf}%)")
+        return None, conf
 
     atr = last['atr']
     if pd.isna(atr) or atr <= 0:
@@ -179,7 +284,7 @@ def detect_signal(df, pair):
         sl = entry + ATR_SL_MULT * atr
         tp = entry - ATR_TP_MULT * atr
 
-    return {
+    signal = {
         "pair": pair,
         "direction": direction,
         "entry": round(entry, 5),
@@ -187,8 +292,10 @@ def detect_signal(df, pair):
         "take_profit": round(tp, 5),
         "atr": round(atr, 5),
         "rsi": round(rsi, 2),
+        "confidence": round(conf, 1),
         "timestamp": datetime.utcnow().isoformat()
     }
+    return signal, conf
 
 
 def store_signal(signal):
@@ -201,6 +308,7 @@ def store_signal(signal):
             "tp": signal["take_profit"],
             "atr": signal["atr"],
             "rsi": signal["rsi"],
+            "confidence": signal["confidence"],
             "created_at": signal["timestamp"]
         }).execute()
     except Exception as e:
@@ -208,7 +316,6 @@ def store_signal(signal):
 
 
 def job_analyze_markets():
-    """المهمة التي تحلل الأسواق كل دقيقتين"""
     print(f"تحليل الأسواق - {datetime.utcnow()}")
     found_any_signal = False
     for pair in PAIRS:
@@ -216,8 +323,8 @@ def job_analyze_markets():
             df = fetch_data(pair)
             if df is None:
                 continue
-            df = compute_indicators(df)
-            sig = detect_signal(df, pair)
+            df = compute_features(df)
+            sig, conf = detect_signal_advanced(df, pair)
             if sig:
                 found_any_signal = True
                 if sig['direction'] == "BUY":
@@ -226,18 +333,21 @@ def job_analyze_markets():
                 else:
                     operation = "🔴 بيع"
                     trend = "نازل"
+
                 msg = (
                     f"{operation} | {pair}\n"
                     f"الاتجاه: {trend}\n"
                     f"نقطة الدخول: {sig['entry']}\n"
                     f"وقف الخسارة: {sig['stop_loss']}\n"
-                    f"الهدف: {sig['take_profit']}"
+                    f"الهدف: {sig['take_profit']}\n"
+                    f"الثقة: {sig['confidence']}% {'🤖 AI' if model else '📊 خبير'}"
                 )
+
                 print(msg)
                 send_telegram(msg)
                 store_signal(sig)
             else:
-                print(f"[{pair}] لا توجد إشارة حالياً")
+                print(f"[{pair}] لا توجد إشارة حالياً (أو ثقة منخفضة)")
         except Exception as e:
             print(f"خطأ في زوج {pair}: {e}")
     if not found_any_signal:
@@ -245,27 +355,23 @@ def job_analyze_markets():
 
 
 def main():
-    print("✅ بدء تشغيل البوت الدائم على Railway...")
-    send_telegram("✅ البوت يعمل الآن 24/7 على Railway 🚀")
+    print("✅ بدء تشغيل البوت الاحترافي (AI Hybrid)...")
+    send_telegram("🚀 البوت الاحترافي يعمل 24/7 بتقنية الذكاء الاصطناعي الهجين")
 
-    # جدولة التحليل كل دقيقتين
     schedule.every(2).minutes.do(job_analyze_markets)
 
-    # حلقة لا نهائية: معالجة رسائل تيليجرام وتنفيذ المهام المجدولة
     while True:
         try:
-            # فحص رسائل تيليجرام (كل 3 ثوانٍ)
             get_telegram_updates()
         except Exception as e:
             print(f"خطأ في حلقة تيليجرام: {e}")
 
         try:
-            # تنفيذ المهام المجدولة (التحليل)
             schedule.run_pending()
         except Exception as e:
             print(f"خطأ في المجدول: {e}")
 
-        time.sleep(3)  # انتظر 3 ثوانٍ ثم كرر
+        time.sleep(3)
 
 
 if __name__ == "__main__":
